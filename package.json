@@ -1,6 +1,6 @@
 {
   "name": "ghf-gsis-lookup",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -8,6 +8,6 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "playwright-core": "^1.47.2"
+    "playwright": "^1.47.2"
   }
 }
