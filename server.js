@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 // --- CORS ---
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
-  .map((s) => s.trim())
+  .map(s => s.trim())
   .filter(Boolean);
 
 app.use((req, res, next) => {
@@ -64,7 +64,6 @@ async function gsisLookupViaBrowser(lat, lng) {
 
   const page = await browser.newPage();
 
-  // establish cookies/session
   await page.goto("https://maps.gsis.gr/valuemaps/", {
     waitUntil: "domcontentloaded",
     timeout: 60000,
@@ -129,7 +128,6 @@ app.post("/lookup", requireApiKey, async (req, res) => {
     }
 
     const data = await gsisLookupViaBrowser(latNum, lngNum);
-
     cache.set(key, { ts: Date.now(), data });
 
     return res.json({ ...data, cached: false });
