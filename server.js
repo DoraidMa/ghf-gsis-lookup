@@ -1,6 +1,6 @@
 import express from "express";
 import crypto from "crypto";
-import { chromium } from "playwright";
+import { chromium } from "playwright-core";
 
 const app = express();
 app.use(express.json({ limit: "256kb" }));
@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 // --- CORS ---
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
 app.use((req, res, next) => {
@@ -36,7 +36,7 @@ function requireApiKey(req, res, next) {
 }
 
 // ---- Cache ----
-const cache = new Map();
+const cache = new Map(); // key -> {ts, data}
 const CACHE_TTL_DAYS = Number(process.env.CACHE_TTL_DAYS || 30);
 const CACHE_TTL_MS = 1000 * 60 * 60 * 24 * CACHE_TTL_DAYS;
 
@@ -62,54 +62,61 @@ async function gsisLookupViaBrowser(lat, lng) {
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
 
-  const page = await browser.newPage();
+  try {
+    const page = await browser.newPage();
 
-  await page.goto("https://maps.gsis.gr/valuemaps/", {
-    waitUntil: "domcontentloaded",
-    timeout: 60000,
-  });
-
-  const result = await page.evaluate(async ({ x, y }) => {
-    const base =
-      "https://maps.gsis.gr/valuemaps2/PHP/proxy.php?https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1/query";
-
-    const params = new URLSearchParams({
-      f: "json",
-      where: "",
-      returnGeometry: "true",
-      spatialRel: "esriSpatialRelIntersects",
-      geometry: JSON.stringify({ x, y, spatialReference: { wkid: 102100 } }),
-      geometryType: "esriGeometryPoint",
-      inSR: "102100",
-      outFields: "ZONENAME,CURRENTZONEVALUE,ZONEREGISTRYID,TIMH",
-      outSR: "102100",
-      distance: "0.01",
-      units: "esriSRUnit_Meter",
+    // Establish cookies/session
+    await page.goto("https://maps.gsis.gr/valuemaps/", {
+      waitUntil: "domcontentloaded",
+      timeout: 60000,
     });
 
-    const url = `${base}?${params.toString()}`;
-    const res = await fetch(url, { method: "GET", credentials: "include" });
-    const json = await res.json();
+    // Run query inside browser context (keeps cookies)
+    const result = await page.evaluate(async ({ x, y }) => {
+      const base =
+        "https://maps.gsis.gr/valuemaps2/PHP/proxy.php?https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1/query";
 
-    const attrs = json?.features?.[0]?.attributes;
-    if (!attrs) return { ok: false, error: "No attributes returned" };
+      const params = new URLSearchParams({
+        f: "json",
+        where: "",
+        returnGeometry: "true",
+        spatialRel: "esriSpatialRelIntersects",
+        geometry: JSON.stringify({ x, y, spatialReference: { wkid: 102100 } }),
+        geometryType: "esriGeometryPoint",
+        inSR: "102100",
+        outFields: "ZONENAME,CURRENTZONEVALUE,ZONEREGISTRYID,TIMH",
+        outSR: "102100",
+        distance: "0.01",
+        units: "esriSRUnit_Meter",
+      });
 
-    const tz = (attrs.TIMH ?? attrs.CURRENTZONEVALUE) ?? null;
+      const url = `${base}?${params.toString()}`;
+      const res = await fetch(url, { method: "GET", credentials: "include" });
+      const json = await res.json();
 
-    return {
-      ok: true,
-      zone_id: attrs.ZONEREGISTRYID ?? null,
-      zone_name: attrs.ZONENAME ?? null,
-      tz_eur_sqm: tz != null ? Number(tz) : null,
-    };
-  }, { x, y });
+      const attrs = json?.features?.[0]?.attributes;
+      if (!attrs) return { ok: false, error: "No attributes returned" };
 
-  await browser.close();
-  return result;
+      const tz = (attrs.TIMH ?? attrs.CURRENTZONEVALUE) ?? null;
+
+      return {
+        ok: true,
+        zone_id: attrs.ZONEREGISTRYID ?? null,
+        zone_name: attrs.ZONENAME ?? null,
+        tz_eur_sqm: tz != null ? Number(tz) : null,
+      };
+    }, { x, y });
+
+    return result;
+  } finally {
+    await browser.close();
+  }
 }
 
+// Health
 app.get("/health", (_, res) => res.json({ ok: true }));
 
+// Lookup
 app.post("/lookup", requireApiKey, async (req, res) => {
   try {
     const { lat, lng } = req.body || {};
@@ -128,7 +135,10 @@ app.post("/lookup", requireApiKey, async (req, res) => {
     }
 
     const data = await gsisLookupViaBrowser(latNum, lngNum);
-    cache.set(key, { ts: Date.now(), data });
+
+    // Cache OK results longer, failures briefly
+    const ttlMs = data.ok ? CACHE_TTL_MS : 1000 * 60 * 10; // 10 min for failures
+    cache.set(key, { ts: Date.now(), data, ttlMs });
 
     return res.json({ ...data, cached: false });
   } catch (e) {
