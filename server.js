@@ -7,7 +7,7 @@ app.use(express.json({ limit: "256kb" }));
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.API_KEY || "";
 
-// CORS (safe default)
+// Simple CORS (safe; WP proxy doesn't need it, but ok)
 app.use((req, res, next) => {
   const origin = req.headers.origin || "*";
   res.setHeader("Access-Control-Allow-Origin", origin);
@@ -19,19 +19,19 @@ app.use((req, res, next) => {
 });
 
 function requireApiKey(req, res, next) {
-  if (!API_KEY) return next();
+  if (!API_KEY) return next(); // if not set, allow (not recommended)
   const key = req.headers["x-api-key"];
   if (key !== API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
   next();
 }
 
-// cache
-const cache = new Map();
+// Cache by ZIP
+const cache = new Map(); // key -> { ts, ttl, data }
 const CACHE_OK_MS = 1000 * 60 * 60 * 24 * 30;
 const CACHE_FAIL_MS = 1000 * 60 * 10;
 
 function cacheKeyZip(zip) {
-  return crypto.createHash("md5").update(String(zip).trim()).digest("hex");
+  return crypto.createHash("md5").update(zip).digest("hex");
 }
 function getCache(key) {
   const item = cache.get(key);
@@ -43,48 +43,55 @@ function getCache(key) {
   return item.data;
 }
 
-// Endpoints
 app.get("/", (_, res) => res.status(200).send("ok"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 /**
- * 1) Geocode ZIP to a point using ArcGIS World Geocoding
- * (matches what GSIS UI uses: "ArcGIS World Geocoding Service")
- *
- * NOTE: This is public ArcGIS geocode service.
+ * Geocode ZIP -> point (Greece-biased)
+ * IMPORTANT: We force countryCode=GRC and add ", Greece" to avoid Taiwan etc.
  */
 async function geocodeZipToPoint(zip) {
   const q = String(zip).trim();
 
-  // ArcGIS World Geocoding (public)
-  const geocodeUrl = "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates";
+  const geocodeUrl =
+    "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates";
 
   const params = new URLSearchParams({
     f: "json",
-    singleLine: q,
-    outFields: "*",
+    singleLine: `${q}, Greece`,
     maxLocations: "1",
-    outSR: "4326"
+    outFields: "*",
+    outSR: "4326",
+    countryCode: "GRC",
+    category: "Postal"
   });
 
   const resp = await fetch(`${geocodeUrl}?${params.toString()}`, {
-    headers: { "Accept": "application/json" }
+    headers: { Accept: "application/json" }
   });
 
   if (!resp.ok) return null;
+
   const json = await resp.json().catch(() => null);
   const cand = json?.candidates?.[0];
   const loc = cand?.location;
+
   if (!loc || typeof loc.x !== "number" || typeof loc.y !== "number") return null;
 
-  return { lng: loc.x, lat: loc.y, score: cand.score ?? null, address: cand.address ?? null };
+  return {
+    lng: loc.x,
+    lat: loc.y,
+    score: cand?.score ?? null,
+    address: cand?.address ?? null
+  };
 }
 
 /**
- * 2) Query GSIS zone layer by point (WGS84)
+ * GSIS zone query by point (WGS84)
  */
 async function queryZoneByPoint(lat, lng) {
-  const url = "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1/query";
+  const url =
+    "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1/query";
 
   const geometry = {
     x: lng,
@@ -102,16 +109,17 @@ async function queryZoneByPoint(lat, lng) {
     inSR: "4326",
     outFields: "ZONEREGISTRYID,ZONENAME,TIMH,CURRENTZONEVALUE",
     outSR: "4326",
-    // small tolerance helps for boundary cases
-    distance: "5",
+    // small tolerance helps boundary misses
+    distance: "10",
     units: "esriSRUnit_Meter"
   });
 
   const resp = await fetch(`${url}?${params.toString()}`, {
-    headers: { "Accept": "application/json" }
+    headers: { Accept: "application/json" }
   });
 
   if (!resp.ok) return null;
+
   const json = await resp.json().catch(() => null);
   const attrs = json?.features?.[0]?.attributes;
   if (!attrs) return null;
@@ -119,18 +127,24 @@ async function queryZoneByPoint(lat, lng) {
   const tz = (attrs.TIMH ?? attrs.CURRENTZONEVALUE) ?? null;
 
   return {
-    tz_eur_sqm: tz != null ? Number(tz) : null,
     zone_id: attrs.ZONEREGISTRYID != null ? String(attrs.ZONEREGISTRYID) : null,
     zone_name: attrs.ZONENAME != null ? String(attrs.ZONENAME) : null,
+    tz_eur_sqm: tz != null ? Number(tz) : null,
     raw: attrs
   };
 }
 
-// Main lookup (ZIP)
+/**
+ * ZIP endpoint: POST /lookup-zip { zip: "10681" }
+ */
 app.post("/lookup-zip", requireApiKey, async (req, res) => {
   try {
-    const zip = String(req.body?.zip || "").trim();
-    if (!zip) return res.status(400).json({ ok: false, error: "zip required" });
+    let zip = String(req.body?.zip || "").trim();
+    zip = zip.replace(/\s+/g, "").replace(/\D+/g, ""); // normalize "106 83" -> "10683"
+
+    if (zip.length !== 5) {
+      return res.status(400).json({ ok: false, error: "Invalid zip (must be 5 digits)" });
+    }
 
     const key = cacheKeyZip(zip);
     const cached = getCache(key);
@@ -138,19 +152,14 @@ app.post("/lookup-zip", requireApiKey, async (req, res) => {
 
     const geo = await geocodeZipToPoint(zip);
     if (!geo) {
-      const out = { ok: false, error: "Could not geocode zip", zip };
+      const out = { ok: false, error: "Could not geocode zip (GRC)", zip };
       cache.set(key, { ts: Date.now(), ttl: CACHE_FAIL_MS, data: out });
       return res.json({ ...out, cached: false });
     }
 
     const zone = await queryZoneByPoint(geo.lat, geo.lng);
     if (!zone || !zone.zone_id || !zone.tz_eur_sqm) {
-      const out = {
-        ok: false,
-        error: "No attributes returned",
-        zip,
-        geocode: geo
-      };
+      const out = { ok: false, error: "No attributes returned", zip, geocode: geo };
       cache.set(key, { ts: Date.now(), ttl: CACHE_FAIL_MS, data: out });
       return res.json({ ...out, cached: false });
     }
@@ -166,7 +175,6 @@ app.post("/lookup-zip", requireApiKey, async (req, res) => {
 
     cache.set(key, { ts: Date.now(), ttl: CACHE_OK_MS, data: out });
     return res.json({ ...out, cached: false });
-
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
