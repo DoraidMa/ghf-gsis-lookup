@@ -1,4 +1,4 @@
-import express from "express";
+ import express from "express";
 import crypto from "crypto";
 
 const app = express();
@@ -7,25 +7,7 @@ app.use(express.json({ limit: "256kb" }));
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.API_KEY || "";
 
-// CORS (safe default)
-app.use((req, res, next) => {
-  const origin = req.headers.origin || "*";
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-function requireApiKey(req, res, next) {
-  if (!API_KEY) return next();
-  const key = req.headers["x-api-key"];
-  if (key !== API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
-  next();
-}
-
-// Cache (rounded lat/lng)
+// cache
 const cache = new Map();
 const CACHE_OK_MS = 1000 * 60 * 60 * 24 * 30;
 const CACHE_FAIL_MS = 1000 * 60 * 10;
@@ -45,11 +27,20 @@ function getCache(key) {
   return item.data;
 }
 
-app.get("/", (_, res) => res.status(200).send("ok"));
+function requireApiKey(req, res, next) {
+  if (!API_KEY) return next();
+  const key = req.headers["x-api-key"];
+  if (key !== API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  next();
+}
+
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-async function gsisIdentify(lat, lng) {
-  const identifyUrl =
+/**
+ * GSIS Identify through official proxy
+ */
+async function gsisIdentifyViaProxy(lat, lng) {
+  const identifyBase =
     "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/identify";
 
   const geometry = JSON.stringify({
@@ -70,7 +61,13 @@ async function gsisIdentify(lat, lng) {
     imageDisplay: "800,600,96"
   });
 
-  const resp = await fetch(`${identifyUrl}?${params.toString()}`, {
+  const identifyUrl = `${identifyBase}?${params.toString()}`;
+
+  // proxy wrapper (same used by official app)
+  const proxyUrl =
+    "https://maps.gsis.gr/valuemaps2/PHP/proxy.php?" + encodeURIComponent(identifyUrl);
+
+  const resp = await fetch(proxyUrl, {
     headers: { Accept: "application/json" }
   });
 
@@ -80,6 +77,7 @@ async function gsisIdentify(lat, lng) {
   }
 
   const json = await resp.json().catch(() => null);
+
   const attrs = json?.results?.[0]?.attributes;
   if (!attrs) return { ok: false, error: "No attributes returned" };
 
@@ -89,7 +87,8 @@ async function gsisIdentify(lat, lng) {
     ok: true,
     tz_eur_sqm: tz != null ? Number(tz) : null,
     zone_id: attrs.ZONEREGISTRYID != null ? String(attrs.ZONEREGISTRYID) : null,
-    zone_name: attrs.ZONENAME != null ? String(attrs.ZONENAME) : null
+    zone_name: attrs.ZONENAME != null ? String(attrs.ZONENAME) : null,
+    raw: attrs
   };
 }
 
@@ -106,11 +105,11 @@ app.post("/lookup", requireApiKey, async (req, res) => {
     const cached = getCache(key);
     if (cached) return res.json({ ...cached, cached: true });
 
-    const data = await gsisIdentify(lat, lng);
+    const data = await gsisIdentifyViaProxy(lat, lng);
 
     cache.set(key, { ts: Date.now(), ttl: data.ok ? CACHE_OK_MS : CACHE_FAIL_MS, data });
-    return res.json({ ...data, cached: false });
 
+    return res.json({ ...data, cached: false });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
