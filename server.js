@@ -5,40 +5,28 @@ import { chromium } from "playwright";
 const app = express();
 app.use(express.json({ limit: "256kb" }));
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
-/* ================= CORS ================= */
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+// Root (helps platforms)
+app.get("/", (_, res) => res.status(200).send("ok"));
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && allowedOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  }
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
+// Health
+app.get("/health", (_, res) => res.json({ ok: true }));
 
-/* ================= API KEY ================= */
+// --- API key ---
 const API_KEY = process.env.API_KEY || "";
 function requireApiKey(req, res, next) {
-  if (!API_KEY) return next(); // if not set, allow (not recommended)
+  if (!API_KEY) return next();
   const key = req.headers["x-api-key"];
   if (key !== API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
   next();
 }
 
-/* ================= CACHE ================= */
-const cache = new Map(); // key -> {ts, data, ttl}
+// ---- Cache ----
+const cache = new Map();
 const CACHE_TTL_DAYS = Number(process.env.CACHE_TTL_DAYS || 30);
 const CACHE_OK_MS = 1000 * 60 * 60 * 24 * CACHE_TTL_DAYS;
-const CACHE_FAIL_MS = 1000 * 60 * 10; // 10 minutes for failures
+const CACHE_FAIL_MS = 1000 * 60 * 10;
 
 function cacheKey(lat, lng) {
   const a = lat.toFixed(5);
@@ -56,7 +44,6 @@ function getCache(key) {
   return item.data;
 }
 
-/* ================= HELPERS ================= */
 // WGS84 -> WebMercator (EPSG:102100)
 function toWebMercator(lat, lng) {
   const x = (lng * 20037508.34) / 180.0;
@@ -65,11 +52,9 @@ function toWebMercator(lat, lng) {
   return { x, y };
 }
 
-/* ================= GSIS LOOKUP ================= */
 async function gsisLookupViaBrowser(lat, lng) {
   const { x, y } = toWebMercator(lat, lng);
 
-  // Playwright package + Playwright Docker image => browsers available correctly
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -77,14 +62,11 @@ async function gsisLookupViaBrowser(lat, lng) {
 
   try {
     const page = await browser.newPage();
-
-    // Establish session/cookies
     await page.goto("https://maps.gsis.gr/valuemaps/", {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
 
-    // Query the same ArcGIS layer via proxy, inside browser context
     const result = await page.evaluate(async ({ x, y }) => {
       const base =
         "https://maps.gsis.gr/valuemaps2/PHP/proxy.php?https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1/query";
@@ -126,9 +108,6 @@ async function gsisLookupViaBrowser(lat, lng) {
   }
 }
 
-/* ================= ROUTES ================= */
-app.get("/health", (_, res) => res.json({ ok: true }));
-
 app.post("/lookup", requireApiKey, async (req, res) => {
   try {
     const { lat, lng } = req.body || {};
@@ -153,4 +132,6 @@ app.post("/lookup", requireApiKey, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`✅ GHF GSIS Lookup running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ GHF GSIS Lookup running on port ${PORT}`);
+});
