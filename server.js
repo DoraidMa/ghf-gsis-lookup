@@ -5,10 +5,9 @@ const app = express();
 app.use(express.json({ limit: "256kb" }));
 
 const PORT = Number(process.env.PORT || 3000);
+const API_KEY = process.env.API_KEY || "";
 
-/* ================= CORS (safe default) =================
-   Even if you don't need CORS now (WP proxy), this won't hurt.
-*/
+// CORS (safe default)
 app.use((req, res, next) => {
   const origin = req.headers.origin || "*";
   res.setHeader("Access-Control-Allow-Origin", origin);
@@ -19,25 +18,20 @@ app.use((req, res, next) => {
   next();
 });
 
-/* ================= API KEY ================= */
-const API_KEY = process.env.API_KEY || "";
 function requireApiKey(req, res, next) {
-  if (!API_KEY) return next(); // if not set, allow (not recommended)
+  if (!API_KEY) return next();
   const key = req.headers["x-api-key"];
   if (key !== API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
   next();
 }
 
-/* ================= CACHE ================= */
-const cache = new Map(); // key -> { ts, ttl, data }
-const CACHE_TTL_DAYS = Number(process.env.CACHE_TTL_DAYS || 30);
-const CACHE_OK_MS = 1000 * 60 * 60 * 24 * CACHE_TTL_DAYS;
+// cache
+const cache = new Map();
+const CACHE_OK_MS = 1000 * 60 * 60 * 24 * 30;
 const CACHE_FAIL_MS = 1000 * 60 * 10;
 
-function cacheKey(lat, lng) {
-  const a = lat.toFixed(5);
-  const b = lng.toFixed(5);
-  return crypto.createHash("md5").update(`${a},${b}`).digest("hex");
+function cacheKeyZip(zip) {
+  return crypto.createHash("md5").update(String(zip).trim()).digest("hex");
 }
 function getCache(key) {
   const item = cache.get(key);
@@ -49,14 +43,49 @@ function getCache(key) {
   return item.data;
 }
 
-/* ================= GSIS ArcGIS endpoint =================
-   This is the direct REST service the map uses.
-*/
-const ARCGIS_QUERY_URL =
-  "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1/query";
+// Endpoints
+app.get("/", (_, res) => res.status(200).send("ok"));
+app.get("/health", (_, res) => res.json({ ok: true }));
 
-// Build ArcGIS query in WGS84 (EPSG:4326)
-function buildArcGisUrl(lat, lng) {
+/**
+ * 1) Geocode ZIP to a point using ArcGIS World Geocoding
+ * (matches what GSIS UI uses: "ArcGIS World Geocoding Service")
+ *
+ * NOTE: This is public ArcGIS geocode service.
+ */
+async function geocodeZipToPoint(zip) {
+  const q = String(zip).trim();
+
+  // ArcGIS World Geocoding (public)
+  const geocodeUrl = "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates";
+
+  const params = new URLSearchParams({
+    f: "json",
+    singleLine: q,
+    outFields: "*",
+    maxLocations: "1",
+    outSR: "4326"
+  });
+
+  const resp = await fetch(`${geocodeUrl}?${params.toString()}`, {
+    headers: { "Accept": "application/json" }
+  });
+
+  if (!resp.ok) return null;
+  const json = await resp.json().catch(() => null);
+  const cand = json?.candidates?.[0];
+  const loc = cand?.location;
+  if (!loc || typeof loc.x !== "number" || typeof loc.y !== "number") return null;
+
+  return { lng: loc.x, lat: loc.y, score: cand.score ?? null, address: cand.address ?? null };
+}
+
+/**
+ * 2) Query GSIS zone layer by point (WGS84)
+ */
+async function queryZoneByPoint(lat, lng) {
+  const url = "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1/query";
+
   const geometry = {
     x: lng,
     y: lat,
@@ -71,82 +100,78 @@ function buildArcGisUrl(lat, lng) {
     geometry: JSON.stringify(geometry),
     geometryType: "esriGeometryPoint",
     inSR: "4326",
-    outFields: "ZONENAME,CURRENTZONEVALUE,ZONEREGISTRYID,TIMH",
+    outFields: "ZONEREGISTRYID,ZONENAME,TIMH,CURRENTZONEVALUE",
     outSR: "4326",
-    // add a small tolerance (meters) to avoid edge misses
+    // small tolerance helps for boundary cases
     distance: "5",
     units: "esriSRUnit_Meter"
   });
 
-  return `${ARCGIS_QUERY_URL}?${params.toString()}`;
-}
-
-async function arcGisLookup(lat, lng) {
-  const url = buildArcGisUrl(lat, lng);
-
-  const resp = await fetch(url, {
-    method: "GET",
-    headers: {
-      "Accept": "application/json",
-      "User-Agent": "GHF-GSIS-Lookup/1.0"
-    }
+  const resp = await fetch(`${url}?${params.toString()}`, {
+    headers: { "Accept": "application/json" }
   });
 
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    return { ok: false, error: `ArcGIS HTTP ${resp.status}`, detail: text.slice(0, 200) };
-  }
-
+  if (!resp.ok) return null;
   const json = await resp.json().catch(() => null);
   const attrs = json?.features?.[0]?.attributes;
-
-  if (!attrs) {
-    return { ok: false, error: "No attributes returned" };
-  }
+  if (!attrs) return null;
 
   const tz = (attrs.TIMH ?? attrs.CURRENTZONEVALUE) ?? null;
 
   return {
-    ok: true,
-    zone_id: attrs.ZONEREGISTRYID ?? null,
-    zone_name: attrs.ZONENAME ?? null,
     tz_eur_sqm: tz != null ? Number(tz) : null,
+    zone_id: attrs.ZONEREGISTRYID != null ? String(attrs.ZONEREGISTRYID) : null,
+    zone_name: attrs.ZONENAME != null ? String(attrs.ZONENAME) : null,
     raw: attrs
   };
 }
 
-/* ================= ROUTES ================= */
-app.get("/", (_, res) => res.status(200).send("ok"));
-app.get("/health", (_, res) => res.json({ ok: true }));
-
-app.post("/lookup", requireApiKey, async (req, res) => {
+// Main lookup (ZIP)
+app.post("/lookup-zip", requireApiKey, async (req, res) => {
   try {
-    const { lat, lng } = req.body || {};
-    const latNum = Number(lat);
-    const lngNum = Number(lng);
+    const zip = String(req.body?.zip || "").trim();
+    if (!zip) return res.status(400).json({ ok: false, error: "zip required" });
 
-    if (!Number.isFinite(latNum) || !Number.isFinite(lngNum)) {
-      return res.status(400).json({ ok: false, error: "lat/lng required" });
-    }
-
-    const key = cacheKey(latNum, lngNum);
+    const key = cacheKeyZip(zip);
     const cached = getCache(key);
     if (cached) return res.json({ ...cached, cached: true });
 
-    const data = await arcGisLookup(latNum, lngNum);
+    const geo = await geocodeZipToPoint(zip);
+    if (!geo) {
+      const out = { ok: false, error: "Could not geocode zip", zip };
+      cache.set(key, { ts: Date.now(), ttl: CACHE_FAIL_MS, data: out });
+      return res.json({ ...out, cached: false });
+    }
 
-    cache.set(key, {
-      ts: Date.now(),
-      ttl: data.ok ? CACHE_OK_MS : CACHE_FAIL_MS,
-      data
-    });
+    const zone = await queryZoneByPoint(geo.lat, geo.lng);
+    if (!zone || !zone.zone_id || !zone.tz_eur_sqm) {
+      const out = {
+        ok: false,
+        error: "No attributes returned",
+        zip,
+        geocode: geo
+      };
+      cache.set(key, { ts: Date.now(), ttl: CACHE_FAIL_MS, data: out });
+      return res.json({ ...out, cached: false });
+    }
 
-    return res.json({ ...data, cached: false });
+    const out = {
+      ok: true,
+      zip,
+      tz_eur_sqm: zone.tz_eur_sqm,
+      zone_id: zone.zone_id,
+      zone_name: zone.zone_name,
+      geocode: geo
+    };
+
+    cache.set(key, { ts: Date.now(), ttl: CACHE_OK_MS, data: out });
+    return res.json({ ...out, cached: false });
+
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ GHF GSIS Lookup running on port ${PORT}`);
+  console.log(`✅ GHF GSIS Lookup ZIP service running on port ${PORT}`);
 });
