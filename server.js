@@ -17,14 +17,12 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-
   if (origin && (allowedOrigins.length === 0 || allowedOrigins.includes(origin))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   }
-
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -33,7 +31,7 @@ app.use((req, res, next) => {
    API KEY
 ========================= */
 function requireApiKey(req, res, next) {
-  if (!API_KEY) return next(); // allow if unset (dev only)
+  if (!API_KEY) return next(); // dev-only
   const key = req.headers["x-api-key"];
   if (key !== API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
   next();
@@ -63,37 +61,96 @@ function cacheSet(key, data) {
 }
 
 /* =========================
-   GSIS proxy.php (requires Referer)
+   GSIS PROXY + SESSION
 ========================= */
 const GSIS_PROXY = "https://maps.gsis.gr/valuemaps2/PHP/proxy.php?";
 const GSIS_REFERER = "https://maps.gsis.gr/valuemaps/";
+const GSIS_WARMUP_URL = "https://maps.gsis.gr/valuemaps/";
 
-// The polygon layer (id=1) from the pjson you successfully fetched
-const GSIS_LAYER =
-  "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1";
+// 2021 service (from your successful pjson)
+const GSIS_MAPSERVER = "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer";
+const GSIS_LAYER_POLYGONS = `${GSIS_MAPSERVER}/1`; // ΚΥΚΛΙΚΕΣ ΖΩΝΕΣ (polygon)
+
+// Simple in-memory cookie jar (good enough for one Railway instance)
+let gsisCookieHeader = "";
+
+// Parse and merge Set-Cookie headers into a single Cookie header string
+function mergeSetCookie(existingCookieHeader, setCookieHeaders) {
+  if (!setCookieHeaders) return existingCookieHeader;
+
+  const jar = new Map();
+
+  // load existing
+  if (existingCookieHeader) {
+    existingCookieHeader.split(";").forEach((pair) => {
+      const p = pair.trim();
+      if (!p) return;
+      const idx = p.indexOf("=");
+      if (idx === -1) return;
+      jar.set(p.slice(0, idx), p.slice(idx + 1));
+    });
+  }
+
+  // apply new
+  const arr = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
+  for (const sc of arr) {
+    const first = String(sc).split(";")[0].trim(); // "NAME=value"
+    const idx = first.indexOf("=");
+    if (idx === -1) continue;
+    jar.set(first.slice(0, idx), first.slice(idx + 1));
+  }
+
+  // rebuild
+  return Array.from(jar.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join("; ");
+}
+
+async function warmUpGsisSession() {
+  // If we already have something, don’t spam warmups
+  if (gsisCookieHeader) return;
+
+  const res = await fetch(GSIS_WARMUP_URL, {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0 (GHF-GSIS-Lookup)",
+      Referer: GSIS_REFERER
+    }
+  });
+
+  // Node fetch exposes set-cookie via headers.getSetCookie() in Node 20+
+  const setCookies = res.headers.getSetCookie?.() || res.headers.get("set-cookie");
+  gsisCookieHeader = mergeSetCookie(gsisCookieHeader, setCookies);
+}
 
 function proxiedUrl(targetUrl) {
   return `${GSIS_PROXY}${encodeURIComponent(targetUrl)}`;
 }
 
 async function fetchJsonViaGsisProxy(targetUrl) {
+  await warmUpGsisSession();
+
   const url = proxiedUrl(targetUrl);
 
   const res = await fetch(url, {
     method: "GET",
     headers: {
       Accept: "application/json",
-      Referer: GSIS_REFERER, // ✅ CRITICAL (without this you get 403)
-      "User-Agent": "Mozilla/5.0 (GHF-GSIS-Lookup)"
+      Referer: GSIS_REFERER,
+      "User-Agent": "Mozilla/5.0 (GHF-GSIS-Lookup)",
+      ...(gsisCookieHeader ? { Cookie: gsisCookieHeader } : {})
     }
   });
+
+  const setCookies = res.headers.getSetCookie?.() || res.headers.get("set-cookie");
+  gsisCookieHeader = mergeSetCookie(gsisCookieHeader, setCookies);
 
   const text = await res.text();
   let json;
   try {
     json = JSON.parse(text);
   } catch {
-    return { ok: false, error: `GSIS proxy non-JSON response (HTTP ${res.status})`, raw: text };
+    return { ok: false, error: `Non-JSON from GSIS proxy (HTTP ${res.status})`, raw: text };
   }
 
   if (!res.ok || json?.error) {
@@ -104,49 +161,47 @@ async function fetchJsonViaGsisProxy(targetUrl) {
 }
 
 /* =========================
-   ArcGIS identify (lat/lng -> attributes)
+   LOOKUP (lat/lng -> polygon query)
 ========================= */
-function identifyUrl(lat, lng) {
-  // Provide a tiny extent + imageDisplay; ArcGIS identify expects these.
+async function lookupByLatLng(lat, lng) {
+  // Use the layer query endpoint (NOT pjson, NOT identify)
   const params = new URLSearchParams({
     f: "json",
-    tolerance: "3",
+    where: "1=1",
     returnGeometry: "false",
-    imageDisplay: "800,600,96",
-    mapExtent: `${lng - 0.001},${lat - 0.001},${lng + 0.001},${lat + 0.001}`,
     geometryType: "esriGeometryPoint",
-    geometry: JSON.stringify({ x: lng, y: lat, spatialReference: { wkid: 4326 } }),
-    sr: "4326",
-    layers: "all"
+    spatialRel: "esriSpatialRelIntersects",
+    inSR: "4326",
+    outSR: "4326",
+    outFields: "ZONEREGISTRYID,ZONENAME,CURRENTZONEVALUE",
+    geometry: JSON.stringify({
+      x: Number(lng),
+      y: Number(lat),
+      spatialReference: { wkid: 4326 }
+    })
   });
 
-  return `${GSIS_LAYER}/identify?${params.toString()}`;
-}
-
-async function lookupByLatLng(lat, lng) {
-  const target = identifyUrl(lat, lng);
-  const r = await fetchJsonViaGsisProxy(target);
+  const targetUrl = `${GSIS_LAYER_POLYGONS}/query?${params.toString()}`;
+  const r = await fetchJsonViaGsisProxy(targetUrl);
   if (!r.ok) return r;
 
-  const attrs = r.json?.results?.[0]?.attributes;
-  if (!attrs) return { ok: false, error: "No attributes returned", debug: r.json };
+  const attrs = r.json?.features?.[0]?.attributes;
+  if (!attrs) {
+    return { ok: false, error: "No attributes returned", debug: r.json };
+  }
 
-  // Keep raw until we confirm exact field names in results
-  const tz = attrs.TIMH ?? attrs.CURRENTZONEVALUE ?? attrs.ZONEVALUE ?? null;
-  const zoneId = attrs.ZONEREGISTRYID ?? attrs.ZONEID ?? attrs.ID ?? null;
-  const zoneName = attrs.ZONENAME ?? attrs.NAME ?? attrs.OIKISMOS ?? null;
+  const tz = attrs.CURRENTZONEVALUE ?? null;
 
   return {
     ok: true,
-    tz_eur_sqm: tz != null ? Number(tz) : null,
-    zone_id: zoneId != null ? String(zoneId) : null,
-    zone_name: zoneName != null ? String(zoneName) : null,
-    raw: attrs
+    zone_id: attrs.ZONEREGISTRYID != null ? String(attrs.ZONEREGISTRYID) : null,
+    zone_name: attrs.ZONENAME ?? null,
+    tz_eur_sqm: tz != null ? Number(tz) : null
   };
 }
 
 /* =========================
-   ArcGIS World geocode (zip -> lat/lng)
+   ZIP -> geocode (ArcGIS World) -> lat/lng -> lookup
 ========================= */
 async function geocodeZip(zip) {
   const url =
@@ -155,7 +210,6 @@ async function geocodeZip(zip) {
 
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   const json = await res.json();
-
   const c = json?.candidates?.[0];
   if (!c) return null;
 
@@ -212,3 +266,179 @@ app.post("/lookup-zip", requireApiKey, async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`✅ GHF GSIS Lookup running on ${PORT}`));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+21_INFO/MapServer/1";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+us})`, raw: text };
+
+
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ } }),
+
+
+
+
+
+
+
+
+
+
+son };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+AddressCandidates` +
+&maxLocations=1`;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+});
+
+
+
+
+
+
+
+
+must be 5 digits" });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
