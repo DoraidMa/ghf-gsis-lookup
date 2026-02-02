@@ -6,7 +6,7 @@ app.use(express.json({ limit: "256kb" }));
 
 const PORT = process.env.PORT || 3000;
 
-// ===================== CORS =====================
+// -------------------- CORS --------------------
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -24,7 +24,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ===================== API KEY =====================
+// -------------------- API KEY --------------------
 const API_KEY = process.env.API_KEY || "";
 function requireApiKey(req, res, next) {
   if (!API_KEY) return next();
@@ -33,7 +33,7 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ===================== CACHE =====================
+// -------------------- CACHE --------------------
 const cache = new Map();
 const OK_TTL_MS = 1000 * 60 * 60 * 24 * 30; // 30 days
 const FAIL_TTL_MS = 1000 * 60 * 2;          // 2 minutes
@@ -54,11 +54,12 @@ function cacheSet(key, data, ttl) {
   cache.set(key, { ts: Date.now(), ttl, data });
 }
 
-// ===================== GSIS PROXY =====================
-// IMPORTANT: In your terminal test, proxy works only with Referer.
+// -------------------- GSIS PROXY --------------------
+// IMPORTANT: your successful curl required Referer.
+// We keep it identical.
 const GSIS_PROXY = "https://maps.gsis.gr/valuemaps2/PHP/proxy.php?";
 
-function browserHeaders() {
+function headersLikeBrowser() {
   return {
     Accept: "application/json,text/plain,*/*",
     "User-Agent":
@@ -69,23 +70,20 @@ function browserHeaders() {
 }
 
 async function fetchJsonViaGsisProxy(targetUrl) {
-  // IMPORTANT: must be raw URL after '?', not encoded
+  // IMPORTANT: raw URL after '?', exactly like browser capture
   const url = `${GSIS_PROXY}${targetUrl}`;
 
-  const r = await fetch(url, {
-    method: "GET",
-    headers: browserHeaders(),
-  });
+  const r = await fetch(url, { method: "GET", headers: headersLikeBrowser() });
 
   const text = await r.text();
   let json;
   try {
     json = JSON.parse(text);
   } catch {
-    return { ok: false, error: `GSIS non-JSON (HTTP ${r.status})`, snippet: text.slice(0, 300) };
+    return { ok: false, error: `GSIS non-JSON (HTTP ${r.status})`, snippet: text.slice(0, 250) };
   }
 
-  // ArcGIS returns {error:{code,...}} even with HTTP 200 sometimes
+  // ArcGIS may return {error:{code,...}} even when HTTP 200
   if (json?.error?.code) {
     return { ok: false, error: `ArcGIS error ${json.error.code}`, detail: json.error };
   }
@@ -97,8 +95,8 @@ async function fetchJsonViaGsisProxy(targetUrl) {
   return { ok: true, json };
 }
 
-// ===================== GEOMETRY =====================
-// WGS84 -> WebMercator (wkid 102100 / EPSG:3857)
+// -------------------- GEOMETRY --------------------
+// WGS84 -> WebMercator (wkid 102100 / 3857)
 function toWebMercator(lat, lng) {
   const x = (lng * 20037508.34) / 180.0;
   let y = Math.log(Math.tan(((90.0 + lat) * Math.PI) / 360.0)) / (Math.PI / 180.0);
@@ -106,49 +104,50 @@ function toWebMercator(lat, lng) {
   return { x, y };
 }
 
-// ===================== SERVICE / LAYER =====================
-// From your successful pjson: layer 1 is "ΚΥΚΛΙΚΕΣ ΖΩΝΕΣ" (polygon)
-const SERVICE_2021 =
-  "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer";
+// -------------------- SERVICE --------------------
+// From your pjson: layers 0 and 1 exist, and SR is 102100.
+// The popup click behavior is IDENTIFY.
+const IDENTIFY_URL =
+  "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/identify";
 
-const ZONE_LAYER_ID = 1;
-const LAYER_QUERY = `${SERVICE_2021}/${ZONE_LAYER_ID}/query`;
+// Use only layer 1 (ΚΥΚΛΙΚΕΣ ΖΩΝΕΣ)
+const IDENTIFY_LAYERS = "all:1";
 
-// ===================== LOOKUPS =====================
-async function lookupByLatLng(lat, lng) {
+async function identifyByLatLng(lat, lng) {
   const latNum = Number(lat);
   const lngNum = Number(lng);
   if (!Number.isFinite(latNum) || !Number.isFinite(lngNum)) {
     return { ok: false, error: "Invalid lat/lng" };
   }
 
-  // ✅ This service is wkid 102100 — use WebMercator geometry
+  // Service is 102100, so use WebMercator geometry + sr=102100
   const { x, y } = toWebMercator(latNum, lngNum);
 
-  const params = new URLSearchParams({
-    f: "json",
-    where: "1=1",
-    returnGeometry: "false",
-    spatialRel: "esriSpatialRelIntersects",
-    geometryType: "esriGeometryPoint",
-    inSR: "102100",
-    outSR: "102100",
-    outFields: "ZONEREGISTRYID,ZONENAME,TIMH,CURRENTZONEVALUE",
-    geometry: JSON.stringify({
-      x,
-      y,
-      spatialReference: { wkid: 102100 }
-    }),
-    // small tolerance helps
-    distance: "0.01",
-    units: "esriSRUnit_Meter",
+  const geometry = JSON.stringify({
+    x,
+    y,
+    spatialReference: { wkid: 102100 }
   });
 
-  const targetUrl = `${LAYER_QUERY}?${params.toString()}`;
+  // Identify requires map context:
+  const params = new URLSearchParams({
+    f: "json",
+    geometry,
+    geometryType: "esriGeometryPoint",
+    sr: "102100",
+    layers: IDENTIFY_LAYERS,
+    tolerance: "10",
+    returnGeometry: "false",
+    // valid “map frame” parameters
+    mapExtent: "-20037508,-20037508,20037508,20037508",
+    imageDisplay: "800,600,96"
+  });
+
+  const targetUrl = `${IDENTIFY_URL}?${params.toString()}`;
   const r = await fetchJsonViaGsisProxy(targetUrl);
   if (!r.ok) return r;
 
-  const attrs = r.json?.features?.[0]?.attributes;
+  const attrs = r.json?.results?.[0]?.attributes;
   if (!attrs) return { ok: false, error: "No attributes returned", debug: r.json };
 
   const tz = attrs.TIMH ?? attrs.CURRENTZONEVALUE ?? null;
@@ -157,11 +156,11 @@ async function lookupByLatLng(lat, lng) {
     ok: true,
     zone_id: attrs.ZONEREGISTRYID != null ? String(attrs.ZONEREGISTRYID) : null,
     zone_name: attrs.ZONENAME ?? null,
-    tz_eur_sqm: tz != null ? Number(tz) : null,
+    tz_eur_sqm: tz != null ? Number(tz) : null
   };
 }
 
-// ZIP -> ArcGIS geocode -> lat/lng -> lookupByLatLng
+// -------------------- ZIP -> GEOCODE -> IDENTIFY --------------------
 async function geocodeZip(zip) {
   const clean = String(zip || "").replace(/\D+/g, "");
   if (clean.length !== 5) return null;
@@ -185,22 +184,19 @@ async function geocodeZip(zip) {
   return { lat, lng, address: c?.address ?? null, score };
 }
 
-// ===================== ROUTES =====================
+// -------------------- ROUTES --------------------
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 app.post("/lookup", requireApiKey, async (req, res) => {
   try {
     const lat = Number(req.body?.lat);
     const lng = Number(req.body?.lng);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-      return res.status(400).json({ ok: false, error: "lat/lng required" });
-    }
 
     const key = makeCacheKey({ t: "ll", lat: +lat.toFixed(6), lng: +lng.toFixed(6) });
     const hit = cacheGet(key);
     if (hit) return res.json({ ...hit, cached: true });
 
-    const out = await lookupByLatLng(lat, lng);
+    const out = await identifyByLatLng(lat, lng);
     cacheSet(key, out, out.ok ? OK_TTL_MS : FAIL_TTL_MS);
 
     return res.json({ ...out, cached: false });
@@ -213,9 +209,7 @@ app.post("/lookup-zip", requireApiKey, async (req, res) => {
   try {
     const zip = String(req.body?.zip || "");
     const clean = zip.replace(/\D+/g, "");
-    if (clean.length !== 5) {
-      return res.status(400).json({ ok: false, error: "zip must be 5 digits" });
-    }
+    if (clean.length !== 5) return res.status(400).json({ ok: false, error: "zip must be 5 digits" });
 
     const key = makeCacheKey({ t: "zip", zip: clean });
     const hit = cacheGet(key);
@@ -228,7 +222,7 @@ app.post("/lookup-zip", requireApiKey, async (req, res) => {
       return res.json({ ...out, cached: false });
     }
 
-    const outLL = await lookupByLatLng(geo.lat, geo.lng);
+    const outLL = await identifyByLatLng(geo.lat, geo.lng);
     const out = { ...outLL, zip: clean, geocode: geo };
 
     cacheSet(key, out, out.ok ? OK_TTL_MS : FAIL_TTL_MS);
