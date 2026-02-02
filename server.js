@@ -1,15 +1,19 @@
 import express from "express";
 import crypto from "crypto";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json({ limit: "256kb" }));
 
 const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || "";
 
-// -------------------- CORS --------------------
+/* =========================
+   CORS
+========================= */
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
-  .map((s) => s.trim())
+  .map(s => s.trim())
   .filter(Boolean);
 
 app.use((req, res, next) => {
@@ -24,212 +28,206 @@ app.use((req, res, next) => {
   next();
 });
 
-// -------------------- API KEY --------------------
-const API_KEY = process.env.API_KEY || "";
+/* =========================
+   API KEY GUARD
+========================= */
 function requireApiKey(req, res, next) {
-  if (!API_KEY) return next();
-  const key = req.headers["x-api-key"];
-  if (key !== API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  if (!API_KEY) return next(); // allow if unset (dev only)
+  if (req.headers["x-api-key"] !== API_KEY) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
   next();
 }
 
-// -------------------- CACHE --------------------
+/* =========================
+   CACHE
+========================= */
 const cache = new Map();
-const OK_TTL_MS = 1000 * 60 * 60 * 24 * 30; // 30 days
-const FAIL_TTL_MS = 1000 * 60 * 2;          // 2 minutes
+const TTL_MS = 1000 * 60 * 60 * 24 * 30;
 
-function makeCacheKey(obj) {
+function cacheKey(obj) {
   return crypto.createHash("md5").update(JSON.stringify(obj)).digest("hex");
 }
 function cacheGet(key) {
   const hit = cache.get(key);
   if (!hit) return null;
-  if (Date.now() - hit.ts > hit.ttl) {
+  if (Date.now() - hit.ts > TTL_MS) {
     cache.delete(key);
     return null;
   }
   return hit.data;
 }
-function cacheSet(key, data, ttl) {
-  cache.set(key, { ts: Date.now(), ttl, data });
+function cacheSet(key, data) {
+  cache.set(key, { ts: Date.now(), data });
 }
 
-// -------------------- GSIS PROXY --------------------
-// IMPORTANT: your successful curl required Referer.
-// We keep it identical.
+/* =========================
+   GSIS CONSTANTS
+========================= */
+
+// MUST go through proxy.php
 const GSIS_PROXY = "https://maps.gsis.gr/valuemaps2/PHP/proxy.php?";
 
-function headersLikeBrowser() {
-  return {
-    Accept: "application/json,text/plain,*/*",
-    "User-Agent":
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
-    Referer: "https://maps.gsis.gr/valuemaps/",
-    Origin: "https://maps.gsis.gr",
-  };
+// Layer used by the official map (polygon zones)
+const GSIS_LAYER =
+  "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1";
+
+// Identify endpoint
+function identifyUrl(lat, lng) {
+  const params = new URLSearchParams({
+    f: "json",
+    tolerance: "1",
+    returnGeometry: "false",
+    imageDisplay: "800,600,96",
+    mapExtent: `${lng - 0.001},${lat - 0.001},${lng + 0.001},${lat + 0.001}`,
+    geometryType: "esriGeometryPoint",
+    geometry: JSON.stringify({
+      x: lng,
+      y: lat,
+      spatialReference: { wkid: 4326 }
+    }),
+    sr: "4326",
+    layers: "all"
+  });
+
+  return `${GSIS_LAYER}/identify?${params.toString()}`;
 }
 
-async function fetchJsonViaGsisProxy(targetUrl) {
-  // IMPORTANT: raw URL after '?', exactly like browser capture
-  const url = `${GSIS_PROXY}${targetUrl}`;
+async function fetchViaGsisProxy(targetUrl) {
+  const url = GSIS_PROXY + encodeURIComponent(targetUrl);
 
-  const r = await fetch(url, { method: "GET", headers: headersLikeBrowser() });
+  const res = await fetch(url, {
+    headers: {
+      "Accept": "application/json",
+      // 🔴 THIS HEADER IS CRITICAL
+      "Referer": "https://maps.gsis.gr/valuemaps/",
+      "User-Agent": "Mozilla/5.0 (GHF-GSIS)"
+    }
+  });
 
-  const text = await r.text();
+  const text = await res.text();
   let json;
   try {
     json = JSON.parse(text);
   } catch {
-    return { ok: false, error: `GSIS non-JSON (HTTP ${r.status})`, snippet: text.slice(0, 250) };
+    return { ok: false, error: "Non-JSON response", raw: text };
   }
 
-  // ArcGIS may return {error:{code,...}} even when HTTP 200
-  if (json?.error?.code) {
-    return { ok: false, error: `ArcGIS error ${json.error.code}`, detail: json.error };
-  }
-
-  if (!r.ok) {
-    return { ok: false, error: `GSIS HTTP ${r.status}`, detail: json };
+  if (!res.ok || json.error) {
+    return {
+      ok: false,
+      error: `ArcGIS error ${res.status}`,
+      detail: json
+    };
   }
 
   return { ok: true, json };
 }
 
-// -------------------- GEOMETRY --------------------
-// WGS84 -> WebMercator (wkid 102100 / 3857)
-function toWebMercator(lat, lng) {
-  const x = (lng * 20037508.34) / 180.0;
-  let y = Math.log(Math.tan(((90.0 + lat) * Math.PI) / 360.0)) / (Math.PI / 180.0);
-  y = (y * 20037508.34) / 180.0;
-  return { x, y };
-}
-
-// -------------------- SERVICE --------------------
-// From your pjson: layers 0 and 1 exist, and SR is 102100.
-// The popup click behavior is IDENTIFY.
-const IDENTIFY_URL =
-  "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/identify";
-
-// Use only layer 1 (ΚΥΚΛΙΚΕΣ ΖΩΝΕΣ)
-const IDENTIFY_LAYERS = "all:1";
-
-async function identifyByLatLng(lat, lng) {
-  const latNum = Number(lat);
-  const lngNum = Number(lng);
-  if (!Number.isFinite(latNum) || !Number.isFinite(lngNum)) {
-    return { ok: false, error: "Invalid lat/lng" };
-  }
-
-  // Service is 102100, so use WebMercator geometry + sr=102100
-  const { x, y } = toWebMercator(latNum, lngNum);
-
-  const geometry = JSON.stringify({
-    x,
-    y,
-    spatialReference: { wkid: 102100 }
-  });
-
-  // Identify requires map context:
-  const params = new URLSearchParams({
-    f: "json",
-    geometry,
-    geometryType: "esriGeometryPoint",
-    sr: "102100",
-    layers: IDENTIFY_LAYERS,
-    tolerance: "10",
-    returnGeometry: "false",
-    // valid “map frame” parameters
-    mapExtent: "-20037508,-20037508,20037508,20037508",
-    imageDisplay: "800,600,96"
-  });
-
-  const targetUrl = `${IDENTIFY_URL}?${params.toString()}`;
-  const r = await fetchJsonViaGsisProxy(targetUrl);
+/* =========================
+   LOOKUP BY LAT/LNG
+========================= */
+async function lookupByLatLng(lat, lng) {
+  const target = identifyUrl(lat, lng);
+  const r = await fetchViaGsisProxy(target);
   if (!r.ok) return r;
 
   const attrs = r.json?.results?.[0]?.attributes;
-  if (!attrs) return { ok: false, error: "No attributes returned", debug: r.json };
+  if (!attrs) {
+    return { ok: false, error: "No attributes returned", debug: r.json };
+  }
 
-  const tz = attrs.TIMH ?? attrs.CURRENTZONEVALUE ?? null;
+  // TEMP: return raw so we can see exact field names
+  const tz =
+    attrs.TIMH ??
+    attrs.CURRENTZONEVALUE ??
+    attrs.ZONEVALUE ??
+    null;
+
+  const zoneId =
+    attrs.ZONEREGISTRYID ??
+    attrs.ZONEID ??
+    attrs.ID ??
+    null;
+
+  const zoneName =
+    attrs.ZONENAME ??
+    attrs.NAME ??
+    attrs.OIKISMOS ??
+    null;
 
   return {
     ok: true,
-    zone_id: attrs.ZONEREGISTRYID != null ? String(attrs.ZONEREGISTRYID) : null,
-    zone_name: attrs.ZONENAME ?? null,
-    tz_eur_sqm: tz != null ? Number(tz) : null
+    tz_eur_sqm: tz != null ? Number(tz) : null,
+    zone_id: zoneId != null ? String(zoneId) : null,
+    zone_name: zoneName != null ? String(zoneName) : null,
+    raw: attrs // 🔍 IMPORTANT
   };
 }
 
-// -------------------- ZIP -> GEOCODE -> IDENTIFY --------------------
+/* =========================
+   ZIP → GEOCODE → IDENTIFY
+========================= */
 async function geocodeZip(zip) {
-  const clean = String(zip || "").replace(/\D+/g, "");
-  if (clean.length !== 5) return null;
+  const url =
+    `https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates` +
+    `?f=json&singleLine=${encodeURIComponent(zip)}&countryCode=GRC&outSR=4326&maxLocations=1`;
 
-  const url = new URL("https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates");
-  url.searchParams.set("f", "json");
-  url.searchParams.set("singleLine", clean);
-  url.searchParams.set("maxLocations", "1");
-  url.searchParams.set("outSR", "4326");
-  url.searchParams.set("countryCode", "GRC");
-
-  const res = await fetch(url.toString(), { headers: { Accept: "application/json" } });
+  const res = await fetch(url);
   const json = await res.json();
 
   const c = json?.candidates?.[0];
-  const lat = c?.location?.y;
-  const lng = c?.location?.x;
-  const score = c?.score ?? 0;
+  if (!c) return null;
 
-  if (!Number.isFinite(lat) || !Number.isFinite(lng) || score < 90) return null;
-  return { lat, lng, address: c?.address ?? null, score };
+  return {
+    lat: c.location.y,
+    lng: c.location.x,
+    address: c.address,
+    score: c.score
+  };
 }
 
-// -------------------- ROUTES --------------------
+/* =========================
+   ROUTES
+========================= */
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 app.post("/lookup", requireApiKey, async (req, res) => {
-  try {
-    const lat = Number(req.body?.lat);
-    const lng = Number(req.body?.lng);
-
-    const key = makeCacheKey({ t: "ll", lat: +lat.toFixed(6), lng: +lng.toFixed(6) });
-    const hit = cacheGet(key);
-    if (hit) return res.json({ ...hit, cached: true });
-
-    const out = await identifyByLatLng(lat, lng);
-    cacheSet(key, out, out.ok ? OK_TTL_MS : FAIL_TTL_MS);
-
-    return res.json({ ...out, cached: false });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  const lat = Number(req.body?.lat);
+  const lng = Number(req.body?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return res.status(400).json({ ok: false, error: "lat/lng required" });
   }
+
+  const key = cacheKey({ t: "ll", lat: lat.toFixed(6), lng: lng.toFixed(6) });
+  const hit = cacheGet(key);
+  if (hit) return res.json({ ...hit, cached: true });
+
+  const out = await lookupByLatLng(lat, lng);
+  cacheSet(key, out);
+  res.json({ ...out, cached: false });
 });
 
 app.post("/lookup-zip", requireApiKey, async (req, res) => {
-  try {
-    const zip = String(req.body?.zip || "");
-    const clean = zip.replace(/\D+/g, "");
-    if (clean.length !== 5) return res.status(400).json({ ok: false, error: "zip must be 5 digits" });
-
-    const key = makeCacheKey({ t: "zip", zip: clean });
-    const hit = cacheGet(key);
-    if (hit) return res.json({ ...hit, cached: true });
-
-    const geo = await geocodeZip(clean);
-    if (!geo) {
-      const out = { ok: false, error: "ZIP geocode failed", zip: clean };
-      cacheSet(key, out, FAIL_TTL_MS);
-      return res.json({ ...out, cached: false });
-    }
-
-    const outLL = await identifyByLatLng(geo.lat, geo.lng);
-    const out = { ...outLL, zip: clean, geocode: geo };
-
-    cacheSet(key, out, out.ok ? OK_TTL_MS : FAIL_TTL_MS);
-    return res.json({ ...out, cached: false });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  const zip = String(req.body?.zip || "").replace(/\D+/g, "");
+  if (zip.length !== 5) {
+    return res.status(400).json({ ok: false, error: "zip must be 5 digits" });
   }
+
+  const key = cacheKey({ t: "zip", zip });
+  const hit = cacheGet(key);
+  if (hit) return res.json({ ...hit, cached: true });
+
+  const geo = await geocodeZip(zip);
+  if (!geo) {
+    return res.json({ ok: false, error: "Zip geocode failed" });
+  }
+
+  const out = await lookupByLatLng(geo.lat, geo.lng);
+  cacheSet(key, { ...out, zip, geocode: geo });
+  res.json({ ...out, zip, geocode: geo, cached: false });
 });
 
-app.listen(PORT, () => console.log(`✅ GHF GSIS Lookup running on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`✅ GHF GSIS Lookup running on port ${PORT}`);
+});
