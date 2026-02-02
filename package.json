@@ -1,6 +1,6 @@
 {
   "name": "ghf-gsis-lookup",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "type": "module",
   "main": "server.js",
   "scripts": {
