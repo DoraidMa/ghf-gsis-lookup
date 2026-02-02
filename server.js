@@ -5,7 +5,6 @@ const app = express();
 app.use(express.json({ limit: "256kb" }));
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || "";
 
 /* =========================
    CORS
@@ -30,8 +29,9 @@ app.use((req, res, next) => {
 /* =========================
    API KEY
 ========================= */
+const API_KEY = process.env.API_KEY || "";
 function requireApiKey(req, res, next) {
-  if (!API_KEY) return next(); // dev-only
+  if (!API_KEY) return next(); // dev only
   const key = req.headers["x-api-key"];
   if (key !== API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
   next();
@@ -61,26 +61,29 @@ function cacheSet(key, data) {
 }
 
 /* =========================
-   GSIS PROXY + SESSION
+   GSIS Proxy + Session
+   IMPORTANT: GSIS requires Referer, and sometimes cookies like AGS_ROLES
 ========================= */
 const GSIS_PROXY = "https://maps.gsis.gr/valuemaps2/PHP/proxy.php?";
 const GSIS_REFERER = "https://maps.gsis.gr/valuemaps/";
 const GSIS_WARMUP_URL = "https://maps.gsis.gr/valuemaps/";
 
-// 2021 service (from your successful pjson)
-const GSIS_MAPSERVER = "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer";
-const GSIS_LAYER_POLYGONS = `${GSIS_MAPSERVER}/1`; // ΚΥΚΛΙΚΕΣ ΖΩΝΕΣ (polygon)
+// Service you successfully fetched with Referer:
+const GSIS_MAPSERVER =
+  "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer";
 
-// Simple in-memory cookie jar (good enough for one Railway instance)
+// Layer 1 = "ΚΥΚΛΙΚΕΣ ΖΩΝΕΣ" (polygon)
+const GSIS_LAYER_POLYGONS = `${GSIS_MAPSERVER}/1`;
+
+// In-memory cookie jar (fine for single Railway instance)
 let gsisCookieHeader = "";
 
-// Parse and merge Set-Cookie headers into a single Cookie header string
 function mergeSetCookie(existingCookieHeader, setCookieHeaders) {
   if (!setCookieHeaders) return existingCookieHeader;
 
   const jar = new Map();
 
-  // load existing
+  // load existing cookies
   if (existingCookieHeader) {
     existingCookieHeader.split(";").forEach((pair) => {
       const p = pair.trim();
@@ -91,34 +94,31 @@ function mergeSetCookie(existingCookieHeader, setCookieHeaders) {
     });
   }
 
-  // apply new
+  // apply new cookies
   const arr = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
   for (const sc of arr) {
-    const first = String(sc).split(";")[0].trim(); // "NAME=value"
+    const first = String(sc).split(";")[0].trim(); // NAME=value
     const idx = first.indexOf("=");
     if (idx === -1) continue;
     jar.set(first.slice(0, idx), first.slice(idx + 1));
   }
 
-  // rebuild
   return Array.from(jar.entries())
     .map(([k, v]) => `${k}=${v}`)
     .join("; ");
 }
 
 async function warmUpGsisSession() {
-  // If we already have something, don’t spam warmups
   if (gsisCookieHeader) return;
 
   const res = await fetch(GSIS_WARMUP_URL, {
     method: "GET",
     headers: {
       "User-Agent": "Mozilla/5.0 (GHF-GSIS-Lookup)",
-      Referer: GSIS_REFERER
-    }
+      Referer: GSIS_REFERER,
+    },
   });
 
-  // Node fetch exposes set-cookie via headers.getSetCookie() in Node 20+
   const setCookies = res.headers.getSetCookie?.() || res.headers.get("set-cookie");
   gsisCookieHeader = mergeSetCookie(gsisCookieHeader, setCookies);
 }
@@ -138,8 +138,8 @@ async function fetchJsonViaGsisProxy(targetUrl) {
       Accept: "application/json",
       Referer: GSIS_REFERER,
       "User-Agent": "Mozilla/5.0 (GHF-GSIS-Lookup)",
-      ...(gsisCookieHeader ? { Cookie: gsisCookieHeader } : {})
-    }
+      ...(gsisCookieHeader ? { Cookie: gsisCookieHeader } : {}),
+    },
   });
 
   const setCookies = res.headers.getSetCookie?.() || res.headers.get("set-cookie");
@@ -161,10 +161,10 @@ async function fetchJsonViaGsisProxy(targetUrl) {
 }
 
 /* =========================
-   LOOKUP (lat/lng -> polygon query)
+   LOOKUPS
 ========================= */
 async function lookupByLatLng(lat, lng) {
-  // Use the layer query endpoint (NOT pjson, NOT identify)
+  // Polygon layer query (point intersects polygon)
   const params = new URLSearchParams({
     f: "json",
     where: "1=1",
@@ -177,8 +177,8 @@ async function lookupByLatLng(lat, lng) {
     geometry: JSON.stringify({
       x: Number(lng),
       y: Number(lat),
-      spatialReference: { wkid: 4326 }
-    })
+      spatialReference: { wkid: 4326 },
+    }),
   });
 
   const targetUrl = `${GSIS_LAYER_POLYGONS}/query?${params.toString()}`;
@@ -186,9 +186,7 @@ async function lookupByLatLng(lat, lng) {
   if (!r.ok) return r;
 
   const attrs = r.json?.features?.[0]?.attributes;
-  if (!attrs) {
-    return { ok: false, error: "No attributes returned", debug: r.json };
-  }
+  if (!attrs) return { ok: false, error: "No attributes returned", debug: r.json };
 
   const tz = attrs.CURRENTZONEVALUE ?? null;
 
@@ -196,16 +194,13 @@ async function lookupByLatLng(lat, lng) {
     ok: true,
     zone_id: attrs.ZONEREGISTRYID != null ? String(attrs.ZONEREGISTRYID) : null,
     zone_name: attrs.ZONENAME ?? null,
-    tz_eur_sqm: tz != null ? Number(tz) : null
+    tz_eur_sqm: tz != null ? Number(tz) : null,
   };
 }
 
-/* =========================
-   ZIP -> geocode (ArcGIS World) -> lat/lng -> lookup
-========================= */
 async function geocodeZip(zip) {
   const url =
-    `https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates` +
+    "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates" +
     `?f=json&singleLine=${encodeURIComponent(zip)}&countryCode=GRC&outSR=4326&maxLocations=1`;
 
   const res = await fetch(url, { headers: { Accept: "application/json" } });
@@ -217,7 +212,7 @@ async function geocodeZip(zip) {
     lat: c.location.y,
     lng: c.location.x,
     address: c.address,
-    score: c.score
+    score: c.score,
   };
 }
 
@@ -227,218 +222,50 @@ async function geocodeZip(zip) {
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 app.post("/lookup", requireApiKey, async (req, res) => {
-  const lat = Number(req.body?.lat);
-  const lng = Number(req.body?.lng);
+  try {
+    const lat = Number(req.body?.lat);
+    const lng = Number(req.body?.lng);
 
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    return res.status(400).json({ ok: false, error: "lat/lng required" });
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ ok: false, error: "lat/lng required" });
+    }
+
+    const key = cacheKey({ t: "ll", lat: +lat.toFixed(6), lng: +lng.toFixed(6) });
+    const hit = cacheGet(key);
+    if (hit) return res.json({ ...hit, cached: true });
+
+    const out = await lookupByLatLng(lat, lng);
+    cacheSet(key, out);
+    return res.json({ ...out, cached: false });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
-
-  const key = cacheKey({ t: "ll", lat: +lat.toFixed(6), lng: +lng.toFixed(6) });
-  const hit = cacheGet(key);
-  if (hit) return res.json({ ...hit, cached: true });
-
-  const out = await lookupByLatLng(lat, lng);
-  cacheSet(key, out);
-  return res.json({ ...out, cached: false });
 });
 
 app.post("/lookup-zip", requireApiKey, async (req, res) => {
-  const zip = String(req.body?.zip || "").replace(/\D+/g, "");
-  if (zip.length !== 5) return res.status(400).json({ ok: false, error: "zip must be 5 digits" });
+  try {
+    const zip = String(req.body?.zip || "").replace(/\D+/g, "");
+    if (zip.length !== 5) return res.status(400).json({ ok: false, error: "zip must be 5 digits" });
 
-  const key = cacheKey({ t: "zip", zip });
-  const hit = cacheGet(key);
-  if (hit) return res.json({ ...hit, cached: true });
+    const key = cacheKey({ t: "zip", zip });
+    const hit = cacheGet(key);
+    if (hit) return res.json({ ...hit, cached: true });
 
-  const geo = await geocodeZip(zip);
-  if (!geo) {
-    const out = { ok: false, error: "Zip geocode failed", zip };
-    cacheSet(key, out);
-    return res.json({ ...out, cached: false });
+    const geo = await geocodeZip(zip);
+    if (!geo) {
+      const out = { ok: false, error: "Zip geocode failed", zip };
+      cacheSet(key, out);
+      return res.json({ ...out, cached: false });
+    }
+
+    const out = await lookupByLatLng(geo.lat, geo.lng);
+    const merged = { ...out, zip, geocode: geo };
+
+    cacheSet(key, merged);
+    return res.json({ ...merged, cached: false });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
-
-  const out = await lookupByLatLng(geo.lat, geo.lng);
-  const merged = { ...out, zip, geocode: geo };
-
-  cacheSet(key, merged);
-  return res.json({ ...merged, cached: false });
 });
 
 app.listen(PORT, () => console.log(`✅ GHF GSIS Lookup running on ${PORT}`));
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-  
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-21_INFO/MapServer/1";
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-us})`, raw: text };
-
-
-};
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- } }),
-
-
-
-
-
-
-
-
-
-
-son };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-AddressCandidates` +
-&maxLocations=1`;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-});
-
-
-
-
-
-
-
-
-must be 5 digits" });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
