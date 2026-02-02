@@ -31,7 +31,7 @@ app.use((req, res, next) => {
 // =====================
 const API_KEY = process.env.API_KEY || "";
 function requireApiKey(req, res, next) {
-  if (!API_KEY) return next(); // allow if not set (not recommended)
+  if (!API_KEY) return next();
   const key = req.headers["x-api-key"];
   if (key !== API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
   next();
@@ -61,42 +61,96 @@ function cacheSet(key, data) {
 }
 
 // =====================
-// GSIS Proxy (IMPORTANT)
+// GSIS Proxy + Cookie Jar
 // =====================
-// Official map uses:
-// https://maps.gsis.gr/valuemaps2/PHP/proxy.php?https://maps.gsis.gr/arcgis/rest/...
-//
-// DO NOT encode the target URL.
-// Keep cookies between calls.
 const GSIS_PROXY = "https://maps.gsis.gr/valuemaps2/PHP/proxy.php?";
-
-// minimal cookie jar (per instance)
 let gsisCookies = "";
+let warmedUp = false;
 
-function updateCookiesFromResponse(res) {
-  // Node fetch exposes set-cookie; may contain multiple cookies in one string.
-  const setCookie = res.headers.get("set-cookie");
-  if (!setCookie) return;
+function addCookiesFromResponse(res) {
+  // Node 20 / undici supports getSetCookie()
+  const getSetCookie = res.headers.getSetCookie?.bind(res.headers);
+  const cookies = getSetCookie ? getSetCookie() : [];
 
-  // Keep only cookie pairs (before ';') and merge
-  const parts = setCookie
-    .split(",") // crude split; OK for GSIS cookies
-    .map((c) => c.split(";")[0].trim())
-    .filter(Boolean);
+  // Fallback (less reliable)
+  const fallback = res.headers.get("set-cookie");
+  if (fallback) cookies.push(fallback);
 
-  const existing = new Set(
+  if (!cookies.length) return;
+
+  const jar = new Map(
     gsisCookies
       .split(";")
       .map((x) => x.trim())
       .filter(Boolean)
+      .map((kv) => {
+        const i = kv.indexOf("=");
+        if (i === -1) return [kv, ""];
+        return [kv.slice(0, i), kv.slice(i + 1)];
+      })
   );
 
-  for (const p of parts) existing.add(p);
-  gsisCookies = Array.from(existing).join("; ");
+  for (const c of cookies) {
+    // could contain multiple cookie strings; split safely-ish by newline first
+    const lines = String(c).split("\n");
+    for (const line of lines) {
+      const first = line.split(";")[0].trim(); // cookie pair
+      const eq = first.indexOf("=");
+      if (eq === -1) continue;
+      const name = first.slice(0, eq);
+      const val = first.slice(eq + 1);
+      jar.set(name, val);
+    }
+  }
+
+  gsisCookies = Array.from(jar.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join("; ");
+}
+
+async function warmUpGsis() {
+  if (warmedUp) return;
+
+  // Hit valuemaps page to obtain initial cookies
+  // (Even if it returns HTML, we only want Set-Cookie headers)
+  try {
+    const res = await fetch("https://maps.gsis.gr/valuemaps/", {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (GHF-GSIS-Lookup)",
+        Accept: "text/html,application/xhtml+xml",
+      },
+    });
+    addCookiesFromResponse(res);
+  } catch {
+    // ignore
+  }
+
+  // Also hit proxy itself once with a harmless ArcGIS info endpoint
+  try {
+    const target = "https://maps.gsis.gr/arcgis/rest/info?f=json";
+    const res = await fetch(`${GSIS_PROXY}${target}`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0 (GHF-GSIS-Lookup)",
+        Referer: "https://maps.gsis.gr/valuemaps/",
+        Origin: "https://maps.gsis.gr",
+        ...(gsisCookies ? { Cookie: gsisCookies } : {}),
+      },
+    });
+    addCookiesFromResponse(res);
+  } catch {
+    // ignore
+  }
+
+  warmedUp = true;
 }
 
 async function fetchJsonViaGsisProxy(targetUrl) {
-  // IMPORTANT: no encodeURIComponent here
+  await warmUpGsis();
+
+  // IMPORTANT: do NOT encode targetUrl
   const url = `${GSIS_PROXY}${targetUrl}`;
 
   const res = await fetch(url, {
@@ -110,7 +164,7 @@ async function fetchJsonViaGsisProxy(targetUrl) {
     },
   });
 
-  updateCookiesFromResponse(res);
+  addCookiesFromResponse(res);
 
   const text = await res.text();
   let json;
@@ -120,7 +174,16 @@ async function fetchJsonViaGsisProxy(targetUrl) {
     return {
       ok: false,
       error: `GSIS proxy non-JSON response (HTTP ${res.status})`,
-      snippet: text.slice(0, 200),
+      snippet: text.slice(0, 250),
+    };
+  }
+
+  // 🚨 CRITICAL: ArcGIS may return {error:{code:...,message:...}} with HTTP 200
+  if (json && json.error) {
+    return {
+      ok: false,
+      error: `ArcGIS error ${json.error.code}`,
+      detail: json.error,
     };
   }
 
@@ -132,21 +195,13 @@ async function fetchJsonViaGsisProxy(targetUrl) {
 }
 
 // =====================
-// Layer URLs (based on your capture)
+// Layers (from your screenshots)
 // =====================
-
-// ZIP search you captured (works in browser):
-// .../PUBLIC_ZONES_APAA_2018_INFO/MapServer/18/query
 const ZIP_LAYER_QUERY =
   "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2018_INFO/MapServer/18/query";
 
-// Lat/Lng point-intersects (older working pattern)
 const POINT_LAYER_QUERY =
   "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1/query";
-
-// =====================
-// Lookup functions
-// =====================
 
 function normalizeZip(zip) {
   return String(zip || "").replace(/\D+/g, "");
@@ -156,11 +211,9 @@ async function lookupByZip(zip) {
   const clean = normalizeZip(zip);
   if (clean.length !== 5) return { ok: false, error: "zip must be 5 digits" };
 
-  // EXACT style you captured:
-  // ZONEREGISTRYID = 10681 or UPPER(OIKISMOS) LIKE '%10681%'
+  // EXACT like gov UI capture
   const where = `ZONEREGISTRYID = ${clean} or UPPER(OIKISMOS) LIKE '%${clean}%'`;
 
-  // Step 1: get OBJECTID + ZONENAME (like the official request)
   const p1 = new URLSearchParams({
     f: "json",
     where,
@@ -172,11 +225,11 @@ async function lookupByZip(zip) {
   });
 
   const r1 = await fetchJsonViaGsisProxy(`${ZIP_LAYER_QUERY}?${p1.toString()}`);
-  if (!r1.ok) return r1;
+  if (!r1.ok) return { ...r1, zip: clean };
 
   const attrs1 = r1.json?.features?.[0]?.attributes;
   if (!attrs1 || attrs1.OBJECTID == null) {
-    return { ok: false, error: "No attributes returned", zip: clean };
+    return { ok: false, error: "No attributes returned", zip: clean, debug: r1.json };
   }
 
   const objectId = Number(attrs1.OBJECTID);
@@ -184,7 +237,6 @@ async function lookupByZip(zip) {
     return { ok: false, error: "Invalid OBJECTID returned", zip: clean, attrs: attrs1 };
   }
 
-  // Step 2: query same layer by OBJECTID to get price + zone id
   const p2 = new URLSearchParams({
     f: "json",
     where: `OBJECTID = ${objectId}`,
@@ -195,19 +247,16 @@ async function lookupByZip(zip) {
   });
 
   const r2 = await fetchJsonViaGsisProxy(`${ZIP_LAYER_QUERY}?${p2.toString()}`);
-  if (!r2.ok) return r2;
+  if (!r2.ok) return { ...r2, zip: clean, object_id: String(objectId) };
 
   const attrs2 = r2.json?.features?.[0]?.attributes;
   if (!attrs2) {
-    // fallback: at least return what we got
     return {
-      ok: true,
+      ok: false,
+      error: "No detail attributes returned",
       zip: clean,
-      zone_name: attrs1.ZONENAME ?? null,
       object_id: String(objectId),
-      tz_eur_sqm: null,
-      zone_id: null,
-      note: "Found zone name + object id, but no detail attributes returned",
+      debug: r2.json,
     };
   }
 
@@ -250,7 +299,7 @@ async function lookupByLatLng(lat, lng) {
   if (!r.ok) return r;
 
   const attrs = r.json?.features?.[0]?.attributes;
-  if (!attrs) return { ok: false, error: "No attributes returned" };
+  if (!attrs) return { ok: false, error: "No attributes returned", debug: r.json };
 
   const tz = attrs.TIMH ?? attrs.CURRENTZONEVALUE ?? null;
 
@@ -271,8 +320,8 @@ app.post("/lookup", requireApiKey, async (req, res) => {
   try {
     const lat = Number(req.body?.lat);
     const lng = Number(req.body?.lng);
-
     const key = makeCacheKey({ type: "ll", lat: +lat.toFixed(6), lng: +lng.toFixed(6) });
+
     const hit = cacheGet(key);
     if (hit) return res.json({ ...hit, cached: true });
 
