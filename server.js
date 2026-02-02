@@ -4,125 +4,132 @@ import crypto from "crypto";
 const app = express();
 app.use(express.json({ limit: "256kb" }));
 
-const PORT = Number(process.env.PORT || 3000);
-const API_KEY = process.env.API_KEY || "";
+const PORT = process.env.PORT || 3000;
 
+// ---------- ENV ----------
+const API_KEY = process.env.API_KEY || "";
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const CACHE_TTL_DAYS = Number(process.env.CACHE_TTL_DAYS || 30);
+const CACHE_TTL_MS = 1000 * 60 * 60 * 24 * CACHE_TTL_DAYS;
+
+// ---------- CORS ----------
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && (allowedOrigins.length === 0 || allowedOrigins.includes(origin))) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  }
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// ---------- API KEY ----------
 function requireApiKey(req, res, next) {
-  if (!API_KEY) return next();
+  if (!API_KEY) return next(); // allow if not set (not recommended)
   const key = req.headers["x-api-key"];
   if (key !== API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
   next();
 }
 
-// cache
+// ---------- CACHE ----------
 const cache = new Map();
-const OK_TTL = 1000 * 60 * 60 * 24 * 30;
-const FAIL_TTL = 1000 * 60 * 10;
-
-function keyLL(lat, lng) {
-  return crypto.createHash("md5").update(`${lat.toFixed(6)},${lng.toFixed(6)}`).digest("hex");
-}
-function getCache(k) {
-  const v = cache.get(k);
-  if (!v) return null;
-  if (Date.now() - v.ts > v.ttl) {
-    cache.delete(k);
-    return null;
-  }
-  return v.data;
+function cacheKey(prefix, obj) {
+  return crypto.createHash("md5").update(prefix + JSON.stringify(obj)).digest("hex");
 }
 
-app.get("/", (_, res) => res.status(200).send("ok"));
-app.get("/health", (_, res) => res.json({ ok: true }));
+// ---------- COOKIE JAR (AGS_ROLES) ----------
+let gsisCookie = ""; // e.g. "AGS_ROLES=....; ..."
+let gsisCookieTs = 0;
+const COOKIE_TTL_MS = 1000 * 60 * 20; // refresh every ~20 minutes
 
-async function fetchJson(url) {
-  const resp = await fetch(url, {
+function extractCookie(setCookieHeaders) {
+  if (!setCookieHeaders) return "";
+  const arr = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
+  // Grab only the AGS_ROLES cookie
+  const found = arr.find((c) => String(c).startsWith("AGS_ROLES="));
+  if (!found) return "";
+  // Keep only "AGS_ROLES=..."; ignore attributes
+  return String(found).split(";")[0];
+}
+
+async function ensureGsisCookie() {
+  const fresh = gsisCookie && (Date.now() - gsisCookieTs) < COOKIE_TTL_MS;
+  if (fresh) return gsisCookie;
+
+  // This call sets AGS_ROLES cookie (same host as the proxy)
+  const warmUrl = "https://maps.gsis.gr/valuemaps2/PHP/proxy.php?https://maps.gsis.gr/arcgis/rest/info?f=json";
+
+  const r = await fetch(warmUrl, {
     method: "GET",
     headers: {
       "Accept": "application/json",
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
-      "Referer": "https://maps.gsis.gr/valuemaps/",
-      "Origin": "https://maps.gsis.gr"
+      // a normal browser UA helps
+      "User-Agent": "Mozilla/5.0 (compatible; GHF-GSIS-Lookup/1.0)"
     }
   });
 
-  const text = await resp.text().catch(() => "");
-  if (!resp.ok) return { ok: false, http: resp.status, text: text.slice(0, 240) };
+  // Node fetch: headers.getSetCookie() exists in newer runtimes; otherwise read raw
+  const setCookies = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : r.headers.get("set-cookie");
+  const cookie = extractCookie(setCookies);
 
-  try {
-    return { ok: true, json: JSON.parse(text) };
-  } catch {
-    return { ok: false, http: resp.status, text: text.slice(0, 240) };
+  if (cookie) {
+    gsisCookie = cookie;
+    gsisCookieTs = Date.now();
+  } else {
+    // keep old cookie if we had one
   }
+
+  return gsisCookie;
 }
 
-async function gsisLookup(lat, lng) {
-  const geometry = JSON.stringify({ x: lng, y: lat, spatialReference: { wkid: 4326 } });
+// ---------- HELPERS ----------
+function buildProxyUrl(targetUrl) {
+  // proxy.php expects the full target URL appended, not URL-encoded (browser does it that way)
+  return `https://maps.gsis.gr/valuemaps2/PHP/proxy.php?${targetUrl}`;
+}
 
-  // Identify (closest to clicking polygon)
-  const identifyBase =
-    "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/identify";
+async function proxyFetchJson(targetUrl) {
+  const cookie = await ensureGsisCookie();
 
-  const identifyParams = new URLSearchParams({
-    f: "json",
-    geometry,
-    geometryType: "esriGeometryPoint",
-    sr: "4326",
-    tolerance: "12",
-    returnGeometry: "false",
-    layers: "all:1",
-    mapExtent: "-180,-90,180,90",
-    imageDisplay: "800,600,96"
-  });
-
-  let r = await fetchJson(`${identifyBase}?${identifyParams.toString()}`);
-  if (r.ok) {
-    const attrs = r.json?.results?.[0]?.attributes;
-    if (attrs) {
-      const tz = attrs.TIMH ?? attrs.CURRENTZONEVALUE ?? null;
-      return {
-        ok: true,
-        tz_eur_sqm: tz != null ? Number(tz) : null,
-        zone_id: attrs.ZONEREGISTRYID != null ? String(attrs.ZONEREGISTRYID) : null,
-        zone_name: attrs.ZONENAME != null ? String(attrs.ZONENAME) : null
-      };
+  const url = buildProxyUrl(targetUrl);
+  const r = await fetch(url, {
+    method: "GET",
+    headers: {
+      "Accept": "application/json",
+      "User-Agent": "Mozilla/5.0 (compatible; GHF-GSIS-Lookup/1.0)",
+      ...(cookie ? { "Cookie": cookie } : {})
     }
-  }
-
-  // Query fallback
-  const queryBase =
-    "https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1/query";
-
-  const queryParams = new URLSearchParams({
-    f: "json",
-    where: "1=1",
-    returnGeometry: "false",
-    geometryType: "esriGeometryPoint",
-    spatialRel: "esriSpatialRelIntersects",
-    inSR: "4326",
-    outSR: "4326",
-    outFields: "ZONEREGISTRYID,ZONENAME,TIMH,CURRENTZONEVALUE",
-    distance: "25",
-    units: "esriSRUnit_Meter",
-    geometry
   });
 
-  r = await fetchJson(`${queryBase}?${queryParams.toString()}`);
-  if (!r.ok) return { ok: false, error: `GSIS HTTP ${r.http}`, detail: r.text };
+  const text = await r.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
 
-  const attrs = r.json?.features?.[0]?.attributes;
-  if (!attrs) return { ok: false, error: "No attributes returned" };
+  if (!r.ok) {
+    return { ok: false, error: `GSIS HTTP ${r.status}`, detail: text.slice(0, 400) };
+  }
 
-  const tz = attrs.TIMH ?? attrs.CURRENTZONEVALUE ?? null;
-  return {
-    ok: true,
-    tz_eur_sqm: tz != null ? Number(tz) : null,
-    zone_id: attrs.ZONEREGISTRYID != null ? String(attrs.ZONEREGISTRYID) : null,
-    zone_name: attrs.ZONENAME != null ? String(attrs.ZONENAME) : null
-  };
+  // If GSIS returns HTML error page, json will be null
+  if (!json) {
+    return { ok: false, error: "GSIS returned non-JSON", detail: text.slice(0, 400) };
+  }
+
+  return { ok: true, json };
 }
 
+// ---------- ENDPOINTS ----------
+app.get("/health", (_, res) => res.json({ ok: true }));
+
+/**
+ * POST /lookup  {lat,lng}
+ * Gets TZ + ZoneID using point query via proxy.php (cookie-auth)
+ */
 app.post("/lookup", requireApiKey, async (req, res) => {
   try {
     const lat = Number(req.body?.lat);
@@ -131,19 +138,117 @@ app.post("/lookup", requireApiKey, async (req, res) => {
       return res.status(400).json({ ok: false, error: "lat/lng required" });
     }
 
-    const k = keyLL(lat, lng);
-    const cached = getCache(k);
-    if (cached) return res.json({ ...cached, cached: true });
+    const key = cacheKey("ll:", { lat: +lat.toFixed(6), lng: +lng.toFixed(6) });
+    const cached = cache.get(key);
+    if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
+      return res.json({ ...cached.data, cached: true });
+    }
 
-    const data = await gsisLookup(lat, lng);
-    cache.set(k, { ts: Date.now(), ttl: data.ok ? OK_TTL : FAIL_TTL, data });
+    // Use the SAME dataset family you showed, but point query needs a layer that contains TIMH.
+    // In many setups, 2021 layer "1" has TIMH, but if yours differs we can adjust.
+    const target = new URL("https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2021_INFO/MapServer/1/query");
+    target.searchParams.set("f", "json");
+    target.searchParams.set("where", "1=1");
+    target.searchParams.set("returnGeometry", "false");
+    target.searchParams.set("spatialRel", "esriSpatialRelIntersects");
+    target.searchParams.set("geometryType", "esriGeometryPoint");
+    target.searchParams.set("inSR", "4326");
+    target.searchParams.set("outSR", "4326");
+    target.searchParams.set("outFields", "ZONEREGISTRYID,ZONENAME,TIMH,CURRENTZONEVALUE");
+    target.searchParams.set(
+      "geometry",
+      JSON.stringify({ x: lng, y: lat, spatialReference: { wkid: 4326 } })
+    );
 
-    return res.json({ ...data, cached: false });
+    const r = await proxyFetchJson(target.toString());
+    if (!r.ok) {
+      cache.set(key, { ts: Date.now(), data: r });
+      return res.json({ ...r, cached: false });
+    }
+
+    const attrs = r.json?.features?.[0]?.attributes;
+    if (!attrs) {
+      const out = { ok: false, error: "No attributes returned" };
+      cache.set(key, { ts: Date.now(), data: out });
+      return res.json({ ...out, cached: false });
+    }
+
+    const tz = attrs.TIMH ?? attrs.CURRENTZONEVALUE ?? null;
+
+    const out = {
+      ok: true,
+      tz_eur_sqm: tz != null ? Number(tz) : null,
+      zone_id: attrs.ZONEREGISTRYID != null ? String(attrs.ZONEREGISTRYID) : null,
+      zone_name: attrs.ZONENAME ?? null
+    };
+
+    cache.set(key, { ts: Date.now(), data: out });
+    return res.json({ ...out, cached: false });
+
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ ghf-gsis-lookup running on port ${PORT}`);
+/**
+ * POST /lookup-zip {zip}
+ * Finds candidate zones by ZIP using the EXACT request style you captured (APAA_2018_INFO /MapServer/18/query).
+ * Returns best match + zone_id.
+ */
+app.post("/lookup-zip", requireApiKey, async (req, res) => {
+  try {
+    let zip = String(req.body?.zip || "").trim();
+    zip = zip.replace(/\D+/g, ""); // normalize "106 81" -> "10681"
+    if (zip.length !== 5) return res.status(400).json({ ok: false, error: "zip must be 5 digits" });
+
+    const key = cacheKey("zip:", { zip });
+    const cached = cache.get(key);
+    if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
+      return res.json({ ...cached.data, cached: true });
+    }
+
+    // This matches your captured request, but we include ZONEREGISTRYID in outFields too.
+    const target = new URL("https://maps.gsis.gr/arcgis/rest/services/APAA_PUBLIC/PUBLIC_ZONES_APAA_2018_INFO/MapServer/18/query");
+    target.searchParams.set("f", "json");
+    target.searchParams.set(
+      "where",
+      `ZONEREGISTRYID = ${zip} OR UPPER(OIKISMOS) LIKE '%${zip}%'`
+    );
+    target.searchParams.set("returnGeometry", "false");
+    target.searchParams.set("spatialRel", "esriSpatialRelIntersects");
+    target.searchParams.set("outFields", "ZONEREGISTRYID,ZONENAME,OBJECTID");
+    target.searchParams.set("outSR", "102100");
+    target.searchParams.set("resultRecordCount", "6");
+
+    const r = await proxyFetchJson(target.toString());
+    if (!r.ok) {
+      cache.set(key, { ts: Date.now(), data: r });
+      return res.json({ ...r, cached: false });
+    }
+
+    const features = r.json?.features || [];
+    const attrs = features?.[0]?.attributes || null;
+
+    if (!attrs) {
+      const out = { ok: false, error: "No candidates returned" };
+      cache.set(key, { ts: Date.now(), data: out });
+      return res.json({ ...out, cached: false });
+    }
+
+    const out = {
+      ok: true,
+      zip,
+      zone_id: attrs.ZONEREGISTRYID != null ? String(attrs.ZONEREGISTRYID) : null,
+      zone_name: attrs.ZONENAME ?? null,
+      object_id: attrs.OBJECTID ?? null
+    };
+
+    cache.set(key, { ts: Date.now(), data: out });
+    return res.json({ ...out, cached: false });
+
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 });
+
+app.listen(PORT, () => console.log(`GHF GSIS Lookup running on port ${PORT}`));
